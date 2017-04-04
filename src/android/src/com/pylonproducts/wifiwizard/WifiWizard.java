@@ -21,13 +21,14 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import android.content.BroadcastReceiver;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.NetworkInfo;
 import android.net.wifi.WifiManager;
 import android.net.wifi.WifiConfiguration;
-import android.net.wifi.WifiEnterpriseConfig;
 import android.net.wifi.ScanResult;
 import android.net.wifi.WifiInfo;
-import android.net.wifi.SupplicantState;
 import android.content.Context;
 import android.util.Log;
 
@@ -49,15 +50,17 @@ public class WifiWizard extends CordovaPlugin {
 
     private WifiManager wifiManager;
     private CallbackContext callbackContext;
+    private Context context;
 
     @Override
     public void initialize(CordovaInterface cordova, CordovaWebView webView) {
         super.initialize(cordova, webView);
         this.wifiManager = (WifiManager) cordova.getActivity().getSystemService(Context.WIFI_SERVICE);
+        this.context = webView.getContext();
     }
 
     @Override
-    public boolean execute(String action, JSONArray data, CallbackContext callbackContext)
+    public boolean execute(String action, final JSONArray data, final CallbackContext callbackContext)
                             throws JSONException {
 
         this.callbackContext = callbackContext;
@@ -73,13 +76,25 @@ public class WifiWizard extends CordovaPlugin {
             return false;
         }
         else if(action.equals(ADD_NETWORK)) {
-            return this.addNetwork(callbackContext, data);
+            cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
+                    addNetwork(callbackContext, data);
+                }
+            });
+            return true;
         }
         else if(action.equals(REMOVE_NETWORK)) {
             return this.removeNetwork(callbackContext, data);
         }
         else if(action.equals(CONNECT_NETWORK)) {
-            return this.connectNetwork(callbackContext, data);
+            cordova.getThreadPool().execute(new Runnable() {
+                @Override
+                public void run() {
+                    connectNetwork(callbackContext, data);
+                }
+            });
+            return true;
         }
         else if(action.equals(DISCONNECT_NETWORK)) {
             return this.disconnectNetwork(callbackContext, data);
@@ -245,7 +260,7 @@ public class WifiWizard extends CordovaPlugin {
      *    @param    data                JSON Array, with [0] being SSID to connect
      *    @return    true if network connected, false if failed
      */
-    private boolean connectNetwork(CallbackContext callbackContext, JSONArray data) {
+    private boolean connectNetwork(final CallbackContext callbackContext, JSONArray data) {
         Log.d(TAG, "WifiWizard: connectNetwork entered.");
         if(!validateData(data)) {
             callbackContext.error("WifiWizard: connectNetwork invalid data");
@@ -269,12 +284,33 @@ public class WifiWizard extends CordovaPlugin {
             // We disable the network before connecting, because if this was the last connection before
             // a disconnect(), this will not reconnect.
             wifiManager.disableNetwork(networkIdToConnect);
-            wifiManager.enableNetwork(networkIdToConnect, true);
 
-            SupplicantState supState;
-            WifiInfo wifiInfo = wifiManager.getConnectionInfo();
-            supState = wifiInfo.getSupplicantState();
-            callbackContext.success(supState.toString());
+            final BroadcastReceiver receiver = new BroadcastReceiver() {
+                private Boolean hasDisconnected = false;
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    String action = intent.getAction();
+
+                    if(WifiManager.NETWORK_STATE_CHANGED_ACTION.equals(action)) {
+                        NetworkInfo nwInfo = intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO);
+                        Log.d(TAG, nwInfo.getState().toString());
+
+                        if (NetworkInfo.State.DISCONNECTED.equals(nwInfo.getState())) {
+                            hasDisconnected = true;
+                        }
+
+                        if (hasDisconnected && NetworkInfo.State.CONNECTED.equals(nwInfo.getState())) {
+                            context.unregisterReceiver(this);
+                            callbackContext.success("connected");
+                        }
+                    }
+                }
+            };
+
+            IntentFilter filter = new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+            this.context.registerReceiver(receiver, filter);
+
+            wifiManager.enableNetwork(networkIdToConnect, true);
             return true;
 
         }else{
@@ -344,7 +380,6 @@ public class WifiWizard extends CordovaPlugin {
      *    of the currently configured networks.
      *
      *    @param    callbackContext        A Cordova callback context
-     *    @param    data                JSON Array, with [0] being SSID to connect
      *    @return    true if network disconnected, false if failed
      */
     private boolean listNetworks(CallbackContext callbackContext) {
